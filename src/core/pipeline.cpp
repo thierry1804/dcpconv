@@ -31,7 +31,10 @@
 #include <filesystem>
 #include <algorithm>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <vector>
+#include <functional>
 
 namespace fs = std::filesystem;
 
@@ -342,7 +345,14 @@ void Pipeline::convert(const Composition& comp,
 
     std::cout << "Parallel decode: " << num_workers << " threads\n";
 
-    // Pre-allocate per-slot buffers to avoid repeated allocations
+    // Per-worker resources: each worker gets its own J2K decoder,
+    // color converter, and frame buffers (fully thread-safe, no sharing)
+    struct WorkerContext {
+        J2KDecoder j2k;
+        XYZtoRGB color_conv;
+        WorkerContext(int w, int h) : color_conv(w, h) {}
+    };
+
     struct FrameSlot {
         std::vector<uint8_t> j2k_data;
         std::vector<uint8_t> xyz_buffer;
@@ -350,10 +360,93 @@ void Pipeline::convert(const Composition& comp,
         bool valid = false;
     };
 
+    // Pre-allocate worker contexts (J2K decoder + color converter per thread)
+    std::vector<std::unique_ptr<WorkerContext>> worker_ctxs;
+    worker_ctxs.reserve(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
+        worker_ctxs.push_back(std::make_unique<WorkerContext>(width, height));
+    }
+
+    // Pre-allocate per-slot buffers
     std::vector<FrameSlot> slots(num_workers);
+    size_t xyz_buf_size = width * height * 3 * sizeof(uint16_t);
     for (auto& slot : slots) {
         slot.rgb_buffer.resize(width * height * 3);
+        slot.xyz_buffer.resize(xyz_buf_size);
     }
+
+    // Persistent thread pool: workers wait for work via condition variable
+    // instead of being created/destroyed each batch
+    struct ThreadPool {
+        std::vector<std::thread> threads;
+        std::mutex mutex;
+        std::condition_variable cv_work;
+        std::condition_variable cv_done;
+        std::function<void(int)> task;
+        int batch_size = 0;
+        int completed = 0;
+        bool shutdown = false;
+
+        void start(int n) {
+            threads.reserve(n);
+            for (int i = 0; i < n; ++i) {
+                threads.emplace_back([this, i]() { worker_loop(i); });
+            }
+        }
+
+        void worker_loop(int id) {
+            while (true) {
+                std::function<void(int)> fn;
+                {
+                    std::unique_lock<std::mutex> lk(mutex);
+                    cv_work.wait(lk, [this, id]() {
+                        return shutdown || (task && id < batch_size);
+                    });
+                    if (shutdown) return;
+                    fn = task;
+                }
+
+                fn(id);
+
+                {
+                    std::lock_guard<std::mutex> lk(mutex);
+                    ++completed;
+                }
+                cv_done.notify_one();
+            }
+        }
+
+        void run(int n, std::function<void(int)> fn) {
+            {
+                std::lock_guard<std::mutex> lk(mutex);
+                task = std::move(fn);
+                batch_size = n;
+                completed = 0;
+            }
+            cv_work.notify_all();
+
+            // Wait for all workers in this batch to finish
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                cv_done.wait(lk, [this]() {
+                    return completed >= batch_size;
+                });
+                task = nullptr;
+            }
+        }
+
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lk(mutex);
+                shutdown = true;
+            }
+            cv_work.notify_all();
+            for (auto& t : threads) t.join();
+        }
+    };
+
+    ThreadPool pool;
+    pool.start(num_workers);
 
     // Audio and encode buffers (used sequentially)
     std::vector<uint8_t> encoded_video;
@@ -372,30 +465,21 @@ void Pipeline::convert(const Composition& comp,
         }
 
         // --- Phase 2: Parallel J2K decode + color conversion ---
-        {
-            std::vector<std::thread> workers;
-            workers.reserve(batch_size);
+        pool.run(batch_size, [&slots, &worker_ctxs, width, height](int i) {
+            if (!slots[i].valid) return;
 
-            for (int i = 0; i < batch_size; ++i) {
-                if (!slots[i].valid) continue;
+            auto& ctx = *worker_ctxs[i];
+            int w = width, h = height;
 
-                workers.emplace_back([&slots, i, &color_conv, width, height]() {
-                    J2KDecoder j2k;
-                    int w = width, h = height;
+            slots[i].valid = ctx.j2k.decode(
+                slots[i].j2k_data.data(), slots[i].j2k_data.size(),
+                slots[i].xyz_buffer, w, h);
 
-                    slots[i].valid = j2k.decode(
-                        slots[i].j2k_data.data(), slots[i].j2k_data.size(),
-                        slots[i].xyz_buffer, w, h);
-
-                    if (slots[i].valid) {
-                        color_conv.convert(slots[i].xyz_buffer.data(),
-                                           slots[i].rgb_buffer.data());
-                    }
-                });
+            if (slots[i].valid) {
+                ctx.color_conv.convert(slots[i].xyz_buffer.data(),
+                                       slots[i].rgb_buffer.data());
             }
-
-            for (auto& w : workers) w.join();
-        }
+        });
 
         // --- Phase 3: Sequential encode + mux (preserves frame order) ---
         for (int i = 0; i < batch_size; ++i) {
@@ -451,6 +535,9 @@ void Pipeline::convert(const Composition& comp,
 
         frame += batch_size;
     }
+
+    // Shutdown thread pool
+    pool.stop();
 
     // Flush encoder
     encoder->flush(encoded_video);
