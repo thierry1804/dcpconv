@@ -230,11 +230,7 @@ int main(int argc, char* argv[]) {
 
             int result = pipeline.run();
             if (result == 0) {
-                auto size = fs::file_size(cfg.output_path);
-                double size_mb = static_cast<double>(size) / (1024.0 * 1024.0);
-                std::cout << "\nDone! Output: " << cfg.output_path
-                          << " (" << std::fixed << std::setprecision(1)
-                          << size_mb << " MB)\n";
+                std::cout << "Done!\n";
             }
             return result;
         }

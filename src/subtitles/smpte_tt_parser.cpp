@@ -39,6 +39,27 @@ std::string get_attr(DOMElement* elem, const char* attr) {
     return to_str(val);
 }
 
+std::string local_name(DOMElement* elem) {
+    std::string name = to_str(elem->getLocalName());
+    if (name.empty()) name = to_str(elem->getNodeName());
+    auto colon = name.find(':');
+    if (colon != std::string::npos) name = name.substr(colon + 1);
+    return name;
+}
+
+void find_elements(DOMElement* parent, const std::string& tag,
+                   std::vector<DOMElement*>& out) {
+    DOMNodeList* children = parent->getChildNodes();
+    for (XMLSize_t i = 0; i < children->getLength(); ++i) {
+        DOMNode* node = children->item(i);
+        if (node->getNodeType() != DOMNode::ELEMENT_NODE) continue;
+        auto* elem = dynamic_cast<DOMElement*>(node);
+        if (!elem) continue;
+        if (local_name(elem) == tag) out.push_back(elem);
+        find_elements(elem, tag, out);
+    }
+}
+
 } // anonymous namespace
 
 int64_t SMPTETTParser::parse_timecode(const std::string& tc, int edit_rate) {
@@ -98,9 +119,10 @@ SMPTETTParser::parse(const std::string& xml) {
     std::string default_color = "FFFFFF";
 
     // Parse <Font> defaults at SubtitleList level
-    auto* fonts = doc->getElementsByTagName(XMLString::transcode("Font"));
-    if (fonts->getLength() > 0) {
-        auto* font_elem = dynamic_cast<DOMElement*>(fonts->item(0));
+    std::vector<DOMElement*> fonts;
+    find_elements(root, "Font", fonts);
+    if (!fonts.empty()) {
+        auto* font_elem = fonts[0];
         std::string f = get_attr(font_elem, "ID");
         if (!f.empty()) default_font = f;
         std::string sz = get_attr(font_elem, "Size");
@@ -110,10 +132,9 @@ SMPTETTParser::parse(const std::string& xml) {
     }
 
     // Parse <Subtitle> elements
-    auto* subs = doc->getElementsByTagName(XMLString::transcode("Subtitle"));
-    for (XMLSize_t i = 0; i < subs->getLength(); ++i) {
-        auto* sub = dynamic_cast<DOMElement*>(subs->item(i));
-        if (!sub) continue;
+    std::vector<DOMElement*> subs;
+    find_elements(root, "Subtitle", subs);
+    for (auto* sub : subs) {
 
         std::string time_in = get_attr(sub, "TimeIn");
         std::string time_out = get_attr(sub, "TimeOut");
@@ -124,10 +145,9 @@ SMPTETTParser::parse(const std::string& xml) {
         int64_t end = parse_timecode(time_out, edit_rate);
 
         // Collect text from <Text> children
-        auto* texts = sub->getElementsByTagName(XMLString::transcode("Text"));
-        for (XMLSize_t t = 0; t < texts->getLength(); ++t) {
-            auto* text_elem = dynamic_cast<DOMElement*>(texts->item(t));
-            if (!text_elem) continue;
+        std::vector<DOMElement*> texts;
+        find_elements(sub, "Text", texts);
+        for (auto* text_elem : texts) {
 
             SubtitleEvent evt;
             evt.start_ms = start;

@@ -9,6 +9,7 @@
  */
 
 #include "mp4_muxer.h"
+#define MINIMP4_IMPLEMENTATION
 #include <minimp4.h>
 #include <iostream>
 #include <fstream>
@@ -78,8 +79,8 @@ void MP4Muxer::init(const Config& cfg) {
                                 impl_->file,
                                 [](int64_t offset, const void* data, size_t size, void* token) -> int {
                                     FILE* f = (FILE*)token;
-                                    fseek(f, (long)offset, SEEK_SET);
-                                    return (int)fwrite(data, 1, size, f);
+                                    if (fseek(f, (long)offset, SEEK_SET)) return 1;
+                                    return fwrite(data, 1, size, f) != size;
                                 });
 
         if (!impl_->mux) {

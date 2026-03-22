@@ -38,16 +38,38 @@ std::string to_string(const XMLCh* xmlch) {
     return result;
 }
 
+// Extract local name from a possibly prefixed tag (e.g., "cpl:Segment" → "Segment")
+std::string local_name(DOMElement* elem) {
+    std::string name = to_string(elem->getLocalName());
+    if (name.empty())
+        name = to_string(elem->getNodeName());
+    auto colon = name.find(':');
+    if (colon != std::string::npos)
+        name = name.substr(colon + 1);
+    return name;
+}
+
+// Recursively find all descendant elements matching a local tag name
+void find_elements(DOMElement* parent, const std::string& tag,
+                   std::vector<DOMElement*>& out) {
+    DOMNodeList* children = parent->getChildNodes();
+    for (XMLSize_t i = 0; i < children->getLength(); ++i) {
+        DOMNode* node = children->item(i);
+        if (node->getNodeType() != DOMNode::ELEMENT_NODE) continue;
+        auto* elem = dynamic_cast<DOMElement*>(node);
+        if (!elem) continue;
+        if (local_name(elem) == tag)
+            out.push_back(elem);
+        find_elements(elem, tag, out);
+    }
+}
+
 // Helper: get text content of first child element with given tag
 std::string get_element_text(DOMElement* parent, const char* tag) {
-    auto* nodes = parent->getElementsByTagName(
-        XMLString::transcode(tag));
-    if (nodes->getLength() > 0) {
-        auto* elem = dynamic_cast<DOMElement*>(nodes->item(0));
-        if (elem && elem->getTextContent()) {
-            return to_string(elem->getTextContent());
-        }
-    }
+    std::vector<DOMElement*> elems;
+    find_elements(parent, tag, elems);
+    if (!elems.empty() && elems[0]->getTextContent())
+        return to_string(elems[0]->getTextContent());
     return "";
 }
 
@@ -78,23 +100,21 @@ DCPReader::parse_assetmap(const std::string& path) {
     }
 
     // Find all <Asset> elements
-    auto* assets = doc->getElementsByTagName(XMLString::transcode("Asset"));
-    for (XMLSize_t i = 0; i < assets->getLength(); ++i) {
-        auto* asset = dynamic_cast<DOMElement*>(assets->item(i));
-        if (!asset) continue;
-
+    std::vector<DOMElement*> assets;
+    find_elements(doc->getDocumentElement(), "Asset", assets);
+    for (auto* asset : assets) {
         AssetMapEntry entry;
         entry.uuid = get_element_text(asset, "Id");
 
         // Remove urn:uuid: prefix if present
-        if (entry.uuid.substr(0, 9) == "urn:uuid:")
+        if (entry.uuid.size() >= 9 && entry.uuid.substr(0, 9) == "urn:uuid:")
             entry.uuid = entry.uuid.substr(9);
 
         // Get file path from <ChunkList><Chunk><Path>
-        auto* chunks = asset->getElementsByTagName(XMLString::transcode("Path"));
-        if (chunks->getLength() > 0) {
-            entry.filepath = to_string(
-                dynamic_cast<DOMElement*>(chunks->item(0))->getTextContent());
+        std::vector<DOMElement*> path_elems;
+        find_elements(asset, "Path", path_elems);
+        if (!path_elems.empty()) {
+            entry.filepath = to_string(path_elems[0]->getTextContent());
         }
 
         if (!entry.uuid.empty() && !entry.filepath.empty()) {
@@ -127,7 +147,7 @@ Composition DCPReader::parse_cpl(const std::string& path,
 
     DOMElement* root = doc->getDocumentElement();
     comp.uuid = get_element_text(root, "Id");
-    if (comp.uuid.substr(0, 9) == "urn:uuid:")
+    if (comp.uuid.size() >= 9 && comp.uuid.substr(0, 9) == "urn:uuid:")
         comp.uuid = comp.uuid.substr(9);
 
     comp.title = get_element_text(root, "ContentTitleText");
@@ -141,23 +161,21 @@ Composition DCPReader::parse_cpl(const std::string& path,
     }
 
     // Parse reels
-    auto* reels = doc->getElementsByTagName(XMLString::transcode("Reel"));
-    for (XMLSize_t i = 0; i < reels->getLength(); ++i) {
-        auto* reel = dynamic_cast<DOMElement*>(reels->item(i));
-        if (!reel) continue;
-
+    std::vector<DOMElement*> reels;
+    find_elements(root, "Reel", reels);
+    for (auto* reel : reels) {
         // Look for MainPicture, MainSound, MainSubtitle
         auto process_asset = [&](const char* tag, Asset::Type type,
                                   std::vector<Asset>& target) {
-            auto* elems = reel->getElementsByTagName(
-                XMLString::transcode(tag));
-            if (elems->getLength() == 0) return;
+            std::vector<DOMElement*> found;
+            find_elements(reel, tag, found);
+            if (found.empty()) return;
 
-            auto* elem = dynamic_cast<DOMElement*>(elems->item(0));
+            auto* elem = found[0];
             if (!elem) return;
 
             std::string uuid = get_element_text(elem, "Id");
-            if (uuid.substr(0, 9) == "urn:uuid:")
+            if (uuid.size() >= 9 && uuid.substr(0, 9) == "urn:uuid:")
                 uuid = uuid.substr(9);
 
             // Resolve UUID to file path via asset map

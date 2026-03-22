@@ -35,6 +35,27 @@ std::string get_attr(DOMElement* e, const char* a) {
     XMLString::release(&n);
     return to_str(v);
 }
+
+std::string local_name_cc(DOMElement* elem) {
+    std::string name = to_str(elem->getLocalName());
+    if (name.empty()) name = to_str(elem->getNodeName());
+    auto colon = name.find(':');
+    if (colon != std::string::npos) name = name.substr(colon + 1);
+    return name;
+}
+
+void find_elements(DOMElement* parent, const std::string& tag,
+                   std::vector<DOMElement*>& out) {
+    DOMNodeList* children = parent->getChildNodes();
+    for (XMLSize_t i = 0; i < children->getLength(); ++i) {
+        DOMNode* node = children->item(i);
+        if (node->getNodeType() != DOMNode::ELEMENT_NODE) continue;
+        auto* elem = dynamic_cast<DOMElement*>(node);
+        if (!elem) continue;
+        if (local_name_cc(elem) == tag) out.push_back(elem);
+        find_elements(elem, tag, out);
+    }
+}
 } // anonymous
 
 int64_t CineCanvasParser::parse_timecode(const std::string& tc, int edit_rate) {
@@ -68,18 +89,15 @@ CineCanvasParser::parse(const std::string& xml) {
     std::string rate = get_attr(root, "EditRate");
     if (!rate.empty()) edit_rate = std::stoi(rate);
 
-    auto* subs = doc->getElementsByTagName(XMLString::transcode("Subtitle"));
-    for (XMLSize_t i = 0; i < subs->getLength(); ++i) {
-        auto* sub = dynamic_cast<DOMElement*>(subs->item(i));
-        if (!sub) continue;
-
+    std::vector<DOMElement*> subs;
+    find_elements(root, "Subtitle", subs);
+    for (auto* sub : subs) {
         int64_t start = parse_timecode(get_attr(sub, "TimeIn"), edit_rate);
         int64_t end = parse_timecode(get_attr(sub, "TimeOut"), edit_rate);
 
-        auto* texts = sub->getElementsByTagName(XMLString::transcode("Text"));
-        for (XMLSize_t t = 0; t < texts->getLength(); ++t) {
-            auto* te = dynamic_cast<DOMElement*>(texts->item(t));
-            if (!te) continue;
+        std::vector<DOMElement*> texts;
+        find_elements(sub, "Text", texts);
+        for (auto* te : texts) {
 
             SubtitleEvent evt;
             evt.start_ms = start;

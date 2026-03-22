@@ -246,7 +246,8 @@ build_x265() {
         -DCMAKE_CXX_STANDARD=14 \
         -DCMAKE_CXX_FLAGS="-isysroot ${MACOS_SDK} -stdlib=libc++ -Wno-register" \
         -DENABLE_SHARED=OFF \
-        -DENABLE_CLI=OFF
+        -DENABLE_CLI=OFF \
+        -DENABLE_ASSEMBLY=OFF
     make -j${JOBS}
     make install
     log "x265: OK"

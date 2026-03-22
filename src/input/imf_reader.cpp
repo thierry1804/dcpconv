@@ -37,13 +37,38 @@ std::string to_str(const XMLCh* xmlch) {
     return result;
 }
 
-std::string get_text(DOMElement* parent, const char* tag) {
-    auto* nodes = parent->getElementsByTagName(XMLString::transcode(tag));
-    if (nodes->getLength() > 0) {
-        auto* elem = dynamic_cast<DOMElement*>(nodes->item(0));
-        if (elem && elem->getTextContent())
-            return to_str(elem->getTextContent());
+// Extract local name from a possibly prefixed tag (e.g., "cpl:Segment" → "Segment")
+std::string local_name(DOMElement* elem) {
+    // getLocalName() works when namespace-aware; getNodeName() is fallback
+    std::string name = to_str(elem->getLocalName());
+    if (name.empty())
+        name = to_str(elem->getNodeName());
+    auto colon = name.find(':');
+    if (colon != std::string::npos)
+        name = name.substr(colon + 1);
+    return name;
+}
+
+// Recursively find all descendant elements matching a local tag name
+void find_elements(DOMElement* parent, const std::string& tag,
+                   std::vector<DOMElement*>& out) {
+    DOMNodeList* children = parent->getChildNodes();
+    for (XMLSize_t i = 0; i < children->getLength(); ++i) {
+        DOMNode* node = children->item(i);
+        if (node->getNodeType() != DOMNode::ELEMENT_NODE) continue;
+        auto* elem = dynamic_cast<DOMElement*>(node);
+        if (!elem) continue;
+        if (local_name(elem) == tag)
+            out.push_back(elem);
+        find_elements(elem, tag, out);
     }
+}
+
+std::string get_text(DOMElement* parent, const char* tag) {
+    std::vector<DOMElement*> elems;
+    find_elements(parent, tag, elems);
+    if (!elems.empty() && elems[0]->getTextContent())
+        return to_str(elems[0]->getTextContent());
     return "";
 }
 
@@ -135,20 +160,18 @@ IMFReader::parse_assetmap(const std::string& path) {
     DOMDocument* doc = parser.getDocument();
     if (!doc) throw std::runtime_error("Failed to parse ASSETMAP: " + path);
 
-    auto* assets = doc->getElementsByTagName(XMLString::transcode("Asset"));
-    for (XMLSize_t i = 0; i < assets->getLength(); ++i) {
-        auto* asset = dynamic_cast<DOMElement*>(assets->item(i));
-        if (!asset) continue;
-
+    std::vector<DOMElement*> assets;
+    find_elements(doc->getDocumentElement(), "Asset", assets);
+    for (auto* asset : assets) {
         AssetMapEntry entry;
         entry.uuid = get_text(asset, "Id");
-        if (entry.uuid.substr(0, 9) == "urn:uuid:")
+        if (entry.uuid.size() >= 9 && entry.uuid.substr(0, 9) == "urn:uuid:")
             entry.uuid = entry.uuid.substr(9);
 
-        auto* paths = asset->getElementsByTagName(XMLString::transcode("Path"));
-        if (paths->getLength() > 0) {
-            entry.filepath = to_str(
-                dynamic_cast<DOMElement*>(paths->item(0))->getTextContent());
+        std::vector<DOMElement*> path_elems;
+        find_elements(asset, "Path", path_elems);
+        if (!path_elems.empty()) {
+            entry.filepath = to_str(path_elems[0]->getTextContent());
         }
 
         if (!entry.uuid.empty() && !entry.filepath.empty())
@@ -173,7 +196,7 @@ Composition IMFReader::parse_cpl(const std::string& path,
 
     DOMElement* root = doc->getDocumentElement();
     comp.uuid = get_text(root, "Id");
-    if (comp.uuid.substr(0, 9) == "urn:uuid:")
+    if (comp.uuid.size() >= 9 && comp.uuid.substr(0, 9) == "urn:uuid:")
         comp.uuid = comp.uuid.substr(9);
 
     comp.title = get_text(root, "ContentTitle");
@@ -181,29 +204,22 @@ Composition IMFReader::parse_cpl(const std::string& path,
         comp.title = get_text(root, "ContentTitleText");
 
     // IMF CPL uses Segments → Sequences → Resources
-    auto* segments = doc->getElementsByTagName(XMLString::transcode("Segment"));
-    for (XMLSize_t s = 0; s < segments->getLength(); ++s) {
-        auto* segment = dynamic_cast<DOMElement*>(segments->item(s));
-        if (!segment) continue;
-
+    std::vector<DOMElement*> segments;
+    find_elements(root, "Segment", segments);
+    for (auto* segment : segments) {
         // Each sequence type: MainImageSequence, MainAudioSequence, SubtitlesSequence
         auto process_sequence = [&](const char* seq_tag, Asset::Type type,
                                      std::vector<Asset>& target) {
-            auto* sequences = segment->getElementsByTagName(
-                XMLString::transcode(seq_tag));
-            for (XMLSize_t q = 0; q < sequences->getLength(); ++q) {
-                auto* seq = dynamic_cast<DOMElement*>(sequences->item(q));
-                if (!seq) continue;
-
+            std::vector<DOMElement*> sequences;
+            find_elements(segment, seq_tag, sequences);
+            for (auto* seq : sequences) {
                 // Resources within the sequence
-                auto* resources = seq->getElementsByTagName(
-                    XMLString::transcode("Resource"));
-                for (XMLSize_t r = 0; r < resources->getLength(); ++r) {
-                    auto* res = dynamic_cast<DOMElement*>(resources->item(r));
-                    if (!res) continue;
+                std::vector<DOMElement*> resources;
+                find_elements(seq, "Resource", resources);
+                for (auto* res : resources) {
 
                     std::string track_id = get_text(res, "TrackFileId");
-                    if (track_id.substr(0, 9) == "urn:uuid:")
+                    if (track_id.size() >= 9 && track_id.substr(0, 9) == "urn:uuid:")
                         track_id = track_id.substr(9);
 
                     // Resolve to file

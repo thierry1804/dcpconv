@@ -495,33 +495,97 @@ int Pipeline::run() {
     }
     std::cout << "Detected: " << type_str << "\n";
 
-    // 2. Select composition
-    Composition comp = select_composition(pkg);
-    std::cout << "CPL: " << comp.title << "\n";
+    // 2. Select compositions to convert
+    std::vector<Composition> compositions_to_convert;
 
-    double duration_sec = (double)comp.total_frames *
-                          comp.edit_rate_den / comp.edit_rate_num;
-    int mins = (int)duration_sec / 60;
-    int secs = (int)duration_sec % 60;
-    std::cout << "Duration: " << mins << "m " << secs << "s\n";
+    if (!config_.cpl_filter.empty()) {
+        // Filter: find matching CPL(s)
+        for (const auto& comp : pkg.compositions) {
+            std::string title_lower = comp.title;
+            std::transform(title_lower.begin(), title_lower.end(),
+                           title_lower.begin(), ::tolower);
+            std::string filter_lower = config_.cpl_filter;
+            std::transform(filter_lower.begin(), filter_lower.end(),
+                           filter_lower.begin(), ::tolower);
 
-    if (comp.video_assets.empty()) {
-        throw std::runtime_error("No video assets in selected composition.");
+            if (title_lower.find(filter_lower) != std::string::npos ||
+                comp.kind.find(filter_lower) != std::string::npos) {
+                compositions_to_convert.push_back(comp);
+            }
+        }
+        if (compositions_to_convert.empty()) {
+            throw std::runtime_error("No CPL matching filter '" +
+                                     config_.cpl_filter + "' found.");
+        }
+    } else {
+        // No filter: convert ALL compositions
+        compositions_to_convert = pkg.compositions;
     }
 
-    std::cout << "Video: " << comp.video_assets[0].width << "x"
-              << comp.video_assets[0].height << " @ "
-              << comp.edit_rate_num << " fps\n";
+    std::cout << "CPLs to convert: " << compositions_to_convert.size() << "\n\n";
 
-    // 3. Parse subtitles
-    auto subs = parse_subtitles(comp);
-    if (!subs.empty()) {
-        std::cout << "Subtitles: " << subs.size() << " events\n";
+    // 3. Generate output path for each CPL
+    //    Single CPL: use output_path as-is
+    //    Multiple CPLs: base_1.mp4, base_2.mp4, ...
+    fs::path out_path(config_.output_path);
+    std::string stem = out_path.stem().string();
+    std::string ext = out_path.extension().string();
+    fs::path out_dir = out_path.parent_path();
+
+    for (size_t idx = 0; idx < compositions_to_convert.size(); ++idx) {
+        const auto& comp = compositions_to_convert[idx];
+
+        // Build per-CPL output path
+        std::string cpl_output;
+        if (compositions_to_convert.size() == 1) {
+            cpl_output = config_.output_path;
+        } else {
+            cpl_output = (out_dir / (stem + "_" + std::to_string(idx + 1) + ext)).string();
+        }
+
+        std::cout << "--- CPL " << (idx + 1) << "/" << compositions_to_convert.size()
+                  << ": " << comp.title << " ---\n";
+
+        double duration_sec = (double)comp.total_frames *
+                              comp.edit_rate_den / comp.edit_rate_num;
+        int mins = (int)duration_sec / 60;
+        int secs = (int)duration_sec % 60;
+        std::cout << "Duration: " << mins << "m " << secs << "s\n";
+
+        if (comp.video_assets.empty()) {
+            std::cerr << "Warning: No video assets in CPL '" << comp.title
+                      << "', skipping.\n\n";
+            continue;
+        }
+
+        std::cout << "Video: " << comp.video_assets[0].width << "x"
+                  << comp.video_assets[0].height << " @ "
+                  << comp.edit_rate_num << " fps\n";
+        std::cout << "Output: " << cpl_output << "\n";
+
+        // Parse subtitles
+        auto subs = parse_subtitles(comp);
+        if (!subs.empty()) {
+            std::cout << "Subtitles: " << subs.size() << " events\n";
+        }
+
+        // Set output path for this CPL and convert
+        std::string saved_output = config_.output_path;
+        config_.output_path = cpl_output;
+
+        std::cout << "\nEncoding...\n";
+        convert(comp, subs);
+
+        config_.output_path = saved_output;
+
+        // Show file size
+        if (fs::exists(cpl_output)) {
+            auto size = fs::file_size(cpl_output);
+            double size_mb = static_cast<double>(size) / (1024.0 * 1024.0);
+            std::cout << "Output: " << cpl_output << " ("
+                      << std::fixed << std::setprecision(1) << size_mb << " MB)\n\n";
+        }
     }
-
-    // 4. Convert
-    std::cout << "\nEncoding...\n";
-    convert(comp, subs);
 
     return 0;
 }
