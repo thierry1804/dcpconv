@@ -22,7 +22,7 @@ struct Config {
     std::string codec = "h264";       // h264, h265, prores
     std::string prores_profile = "hq"; // proxy, lt, standard, hq, 4444
     int bitrate_mbps = 20;
-    std::string subs_mode = "none";   // none, soft, burn-in, both
+    std::string subs_mode = "auto";   // auto, none, soft, burn-in, both
     std::string font_path;
     int font_size = 42;
     std::string font_color = "FFFFFF";
@@ -51,7 +51,7 @@ VIDEO ENCODING:
     --prores-profile <name>  ProRes profile: proxy, lt, standard, hq (default), 4444
 
 SUBTITLES:
-    -s, --subs <mode>        Subtitle mode: none (default), soft, burn-in, both
+    -s, --subs <mode>        Subtitle mode: auto (default), none, soft, burn-in, both
     --font <path>            Font file for burn-in (default: system Helvetica)
     --font-size <N>          Font size in pixels (default: 42)
     --font-color <hex>       Font color as hex RGB (default: FFFFFF)
@@ -163,10 +163,11 @@ bool validate_config(const Config& cfg) {
     }
 
     // Validate subtitle mode
-    if (cfg.subs_mode != "none" && cfg.subs_mode != "soft" &&
-        cfg.subs_mode != "burn-in" && cfg.subs_mode != "both") {
+    if (cfg.subs_mode != "auto" && cfg.subs_mode != "none" &&
+        cfg.subs_mode != "soft" && cfg.subs_mode != "burn-in" &&
+        cfg.subs_mode != "both") {
         std::cerr << "Error: Unknown subtitle mode '" << cfg.subs_mode
-                  << "'. Use none, soft, burn-in, or both.\n";
+                  << "'. Use auto, none, soft, burn-in, or both.\n";
         return false;
     }
 

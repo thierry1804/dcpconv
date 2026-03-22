@@ -375,8 +375,8 @@ void Pipeline::convert(const Composition& comp,
         slot.xyz_buffer.resize(xyz_buf_size);
     }
 
-    // Persistent thread pool: workers wait for work via condition variable
-    // instead of being created/destroyed each batch
+    // Persistent thread pool with generation counter to prevent
+    // workers from re-executing the same batch
     struct ThreadPool {
         std::vector<std::thread> threads;
         std::mutex mutex;
@@ -385,9 +385,12 @@ void Pipeline::convert(const Composition& comp,
         std::function<void(int)> task;
         int batch_size = 0;
         int completed = 0;
+        uint64_t generation = 0;
+        std::vector<uint64_t> worker_gen; // last generation each worker ran
         bool shutdown = false;
 
         void start(int n) {
+            worker_gen.resize(n, 0);
             threads.reserve(n);
             for (int i = 0; i < n; ++i) {
                 threads.emplace_back([this, i]() { worker_loop(i); });
@@ -400,9 +403,12 @@ void Pipeline::convert(const Composition& comp,
                 {
                     std::unique_lock<std::mutex> lk(mutex);
                     cv_work.wait(lk, [this, id]() {
-                        return shutdown || (task && id < batch_size);
+                        return shutdown ||
+                               (task && id < batch_size &&
+                                worker_gen[id] < generation);
                     });
                     if (shutdown) return;
+                    worker_gen[id] = generation;
                     fn = task;
                 }
 
@@ -422,14 +428,15 @@ void Pipeline::convert(const Composition& comp,
                 task = std::move(fn);
                 batch_size = n;
                 completed = 0;
+                ++generation;
             }
             cv_work.notify_all();
 
             // Wait for all workers in this batch to finish
             {
                 std::unique_lock<std::mutex> lk(mutex);
-                cv_done.wait(lk, [this]() {
-                    return completed >= batch_size;
+                cv_done.wait(lk, [this, n]() {
+                    return completed >= n;
                 });
                 task = nullptr;
             }
@@ -704,6 +711,18 @@ int Pipeline::run() {
                   << comp.edit_rate_num << " fps\n";
         std::cout << "Output: " << cpl_output << "\n";
 
+        // Resolve "auto" subtitle mode per-CPL: burn-in if CPL has subtitles
+        std::string saved_subs_mode = config_.subs_mode;
+        if (config_.subs_mode == "auto") {
+            if (!comp.subtitle_assets.empty()) {
+                config_.subs_mode = "burn-in";
+                std::cout << "Subtitles: auto -> burn-in ("
+                          << comp.subtitle_assets.size() << " asset(s))\n";
+            } else {
+                config_.subs_mode = "none";
+            }
+        }
+
         // Parse subtitles
         auto subs = parse_subtitles(comp);
         if (!subs.empty()) {
@@ -718,6 +737,7 @@ int Pipeline::run() {
         convert(comp, subs);
 
         config_.output_path = saved_output;
+        config_.subs_mode = saved_subs_mode;
 
         // Show file size
         if (fs::exists(cpl_output)) {

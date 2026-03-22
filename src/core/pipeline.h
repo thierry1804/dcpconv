@@ -13,7 +13,7 @@ struct PipelineConfig {
     std::string codec = "h264";
     std::string prores_profile = "hq";
     int64_t bitrate_bps = 20000000;
-    std::string subs_mode = "none";
+    std::string subs_mode = "auto";
     std::string font_path;
     int font_size = 42;
     std::string font_color = "FFFFFF";
