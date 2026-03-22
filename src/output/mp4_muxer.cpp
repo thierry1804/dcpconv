@@ -14,6 +14,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cerrno>
 
 namespace dcpconv {
 
@@ -55,18 +56,54 @@ MP4Muxer::MP4Muxer() : impl_(std::make_unique<Impl>()) {}
 MP4Muxer::~MP4Muxer() {
     if (impl_->mux) {
         MP4E_close(impl_->mux);
+        impl_->mux = nullptr;
     }
     if (impl_->file) {
         fclose(impl_->file);
+        impl_->file = nullptr;
     }
+}
+
+// Robust I/O callback for minimp4
+static int mp4_io_callback(int64_t offset, const void* data, size_t size, void* token) {
+    FILE* f = (FILE*)token;
+    if (!f) return -1;
+
+    // Use fseeko for large files when available
+    #if defined(_POSIX_VERSION)
+        if (fseeko(f, (off_t)offset, SEEK_SET) != 0) {
+            std::cerr << "mp4_io_callback: fseeko failed: " << strerror(errno) << "\n";
+            return -1;
+        }
+    #else
+        if (fseek(f, (long)offset, SEEK_SET) != 0) {
+            std::cerr << "mp4_io_callback: fseek failed: " << strerror(errno) << "\n";
+            return -1;
+        }
+    #endif
+
+    size_t written = fwrite(data, 1, size, f);
+    if (written != size) {
+        std::cerr << "mp4_io_callback: fwrite wrote " << written << " of " << size << "\n";
+        return -1;
+    }
+
+    // Try to flush to ensure data is visible for subsequent reads/seeks
+    if (fflush(f) != 0) {
+        std::cerr << "mp4_io_callback: fflush failed: " << strerror(errno) << "\n";
+        // Not necessarily fatal; continue returning success
+    }
+
+    return 0; // success
 }
 
 void MP4Muxer::init(const Config& cfg) {
     impl_->config = cfg;
 
-    impl_->file = fopen(cfg.output_path.c_str(), "wb");
+    // Open file in read+write binary mode to allow seeking and updates by minimp4
+    impl_->file = fopen(cfg.output_path.c_str(), "w+b");
     if (!impl_->file) {
-        throw std::runtime_error("Cannot open output file: " + cfg.output_path);
+        throw std::runtime_error("Cannot open output file: " + cfg.output_path + " (" + std::strerror(errno) + ")");
     }
 
     if (cfg.is_prores) {
@@ -75,21 +112,34 @@ void MP4Muxer::init(const Config& cfg) {
     } else {
         // H.264 and H.265: use minimp4 for H.264
         impl_->use_minimp4 = true;
+
+        // Open muxer with our robust callback
         impl_->mux = MP4E_open(0 /* sequential */, 0 /* fragmented */,
-                                impl_->file,
-                                [](int64_t offset, const void* data, size_t size, void* token) -> int {
-                                    FILE* f = (FILE*)token;
-                                    if (fseek(f, (long)offset, SEEK_SET)) return 1;
-                                    return fwrite(data, 1, size, f) != size;
-                                });
+                               impl_->file,
+                               mp4_io_callback);
 
         if (!impl_->mux) {
-            throw std::runtime_error("Failed to create MP4 muxer");
+            int err = errno;
+            std::string msg = "Failed to create MP4 muxer";
+            msg += std::string(" (errno: ") + std::to_string(err) + ", " + std::strerror(err) + ")";
+            // Close file handle we opened
+            if (impl_->file) {
+                fclose(impl_->file);
+                impl_->file = nullptr;
+            }
+            throw std::runtime_error(msg);
         }
 
-        // Initialize H.264 writer
+        // Initialize H.264 writer (0 == h264)
         if (mp4_h26x_write_init(&impl_->h264_writer, impl_->mux,
                                  cfg.width, cfg.height, 0 /* h264 */)) {
+            // Clean up on failure
+            MP4E_close(impl_->mux);
+            impl_->mux = nullptr;
+            if (impl_->file) {
+                fclose(impl_->file);
+                impl_->file = nullptr;
+            }
             throw std::runtime_error("Failed to init H.264 writer");
         }
     }
