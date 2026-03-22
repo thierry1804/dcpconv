@@ -30,6 +30,8 @@
 #include <chrono>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -232,15 +234,12 @@ void Pipeline::convert(const Composition& comp,
         audio_demux.open(comp.audio_assets[0].filepath, Asset::Type::AUDIO);
     }
 
-    // 3. Initialize JPEG 2000 decoder
-    J2KDecoder j2k;
-
-    // 4. Initialize color converter
+    // 3. Initialize color converter
     int width = comp.video_assets[0].width;
     int height = comp.video_assets[0].height;
     XYZtoRGB color_conv(width, height);
 
-    // 5. Initialize subtitle burner (if needed)
+    // 4. Initialize subtitle burner (if needed)
     std::unique_ptr<SubtitleBurner> sub_burner;
     bool do_burn = (config_.subs_mode == "burn-in" || config_.subs_mode == "both");
     if (do_burn && !subs.empty()) {
@@ -253,7 +252,7 @@ void Pipeline::convert(const Composition& comp,
         sub_burner = std::make_unique<SubtitleBurner>(burn_cfg);
     }
 
-    // 6. Initialize video encoder
+    // 5. Initialize video encoder
     std::unique_ptr<VideoEncoderBase> encoder;
     if (config_.codec == "h264") {
         H264Encoder::Config enc_cfg;
@@ -289,7 +288,7 @@ void Pipeline::convert(const Composition& comp,
         encoder = std::move(prores);
     }
 
-    // 7. Initialize audio encoder
+    // 6. Initialize audio encoder
     std::unique_ptr<AACEncoder> aac;
     if (has_audio && config_.codec != "prores") {
         AACEncoder::Config aac_cfg;
@@ -300,7 +299,7 @@ void Pipeline::convert(const Composition& comp,
         aac->init(aac_cfg);
     }
 
-    // 8. Initialize MP4/MOV muxer
+    // 7. Initialize MP4/MOV muxer
     MP4Muxer muxer;
     MP4Muxer::Config mux_cfg;
     mux_cfg.output_path = config_.output_path;
@@ -324,78 +323,133 @@ void Pipeline::convert(const Composition& comp,
         sub_mux.write_to_muxer(muxer, subs);
     }
 
-    // 9. Frame-by-frame processing loop
+    // 8. Parallel batch processing
+    //    - MXF demux is sequential (file I/O)
+    //    - J2K decode + color convert run in parallel (CPU-bound)
+    //    - Encode + mux are sequential (stateful, x264 has own threading)
     int64_t total_frames = comp.total_frames;
     auto start_time = std::chrono::steady_clock::now();
 
-    // Frame buffer
-    std::vector<uint8_t> j2k_frame;     // compressed J2K
-    std::vector<uint8_t> xyz_buffer;     // decoded XYZ pixels
-    std::vector<uint8_t> rgb_buffer;     // converted RGB pixels
-    std::vector<uint8_t> encoded_video;  // encoded NAL units / ProRes
-    std::vector<uint8_t> pcm_buffer;     // raw PCM audio
-    std::vector<uint8_t> encoded_audio;  // encoded AAC
+    int num_workers = config_.threads > 0
+        ? config_.threads
+        : std::max(1u, std::thread::hardware_concurrency());
 
-    rgb_buffer.resize(width * height * 3);
+    // Limit decode threads: leave cores for x264's own threading
+    // Use half the cores for decode, x264 uses the rest
+    if (config_.threads == 0 && num_workers > 2) {
+        num_workers = std::max(2, num_workers / 2);
+    }
 
-    for (int64_t frame = 0; frame < total_frames; ++frame) {
-        // Read compressed J2K frame from MXF
-        if (!video_demux.read_frame(j2k_frame)) {
-            std::cerr << "\nWarning: Failed to read video frame " << frame << "\n";
-            break;
+    std::cout << "Parallel decode: " << num_workers << " threads\n";
+
+    // Pre-allocate per-slot buffers to avoid repeated allocations
+    struct FrameSlot {
+        std::vector<uint8_t> j2k_data;
+        std::vector<uint8_t> xyz_buffer;
+        std::vector<uint8_t> rgb_buffer;
+        bool valid = false;
+    };
+
+    std::vector<FrameSlot> slots(num_workers);
+    for (auto& slot : slots) {
+        slot.rgb_buffer.resize(width * height * 3);
+    }
+
+    // Audio and encode buffers (used sequentially)
+    std::vector<uint8_t> encoded_video;
+    std::vector<uint8_t> pcm_buffer;
+    std::vector<uint8_t> encoded_audio;
+
+    int64_t frame = 0;
+
+    while (frame < total_frames) {
+        int batch_size = static_cast<int>(
+            std::min(static_cast<int64_t>(num_workers), total_frames - frame));
+
+        // --- Phase 1: Sequential read of compressed J2K frames from MXF ---
+        for (int i = 0; i < batch_size; ++i) {
+            slots[i].valid = video_demux.read_frame(slots[i].j2k_data);
         }
 
-        // Decode JPEG 2000
-        if (!j2k.decode(j2k_frame.data(), j2k_frame.size(),
-                        xyz_buffer, width, height)) {
-            std::cerr << "\nWarning: Failed to decode J2K frame " << frame << "\n";
-            break;
-        }
+        // --- Phase 2: Parallel J2K decode + color conversion ---
+        {
+            std::vector<std::thread> workers;
+            workers.reserve(batch_size);
 
-        // Color conversion: XYZ → Rec.709 RGB
-        color_conv.convert(xyz_buffer.data(), rgb_buffer.data());
+            for (int i = 0; i < batch_size; ++i) {
+                if (!slots[i].valid) continue;
 
-        // Burn-in subtitles if needed
-        if (sub_burner) {
-            double time_ms = (double)frame * 1000.0 *
-                             comp.edit_rate_den / comp.edit_rate_num;
-            sub_burner->render(rgb_buffer.data(), width, height,
-                               time_ms, subs);
-        }
+                workers.emplace_back([&slots, i, &color_conv, width, height]() {
+                    J2KDecoder j2k;
+                    int w = width, h = height;
 
-        // Encode video frame
-        encoder->encode_frame(rgb_buffer.data(), encoded_video);
+                    slots[i].valid = j2k.decode(
+                        slots[i].j2k_data.data(), slots[i].j2k_data.size(),
+                        slots[i].xyz_buffer, w, h);
 
-        // Write video to muxer
-        if (!encoded_video.empty()) {
-            muxer.write_video(encoded_video.data(), encoded_video.size(), frame);
-        }
-
-        // Read and encode audio (if present)
-        if (has_audio) {
-            // Read enough PCM samples for one video frame
-            int samples_per_frame = comp.audio_assets[0].sample_rate *
-                                    comp.edit_rate_den / comp.edit_rate_num;
-            if (audio_demux.read_audio(pcm_buffer, samples_per_frame)) {
-                if (aac) {
-                    aac->encode(pcm_buffer.data(), pcm_buffer.size(),
-                                encoded_audio);
-                    if (!encoded_audio.empty()) {
-                        muxer.write_audio(encoded_audio.data(),
-                                          encoded_audio.size(), frame);
+                    if (slots[i].valid) {
+                        color_conv.convert(slots[i].xyz_buffer.data(),
+                                           slots[i].rgb_buffer.data());
                     }
-                } else {
-                    // ProRes: write PCM directly
-                    muxer.write_audio(pcm_buffer.data(),
-                                      pcm_buffer.size(), frame);
+                });
+            }
+
+            for (auto& w : workers) w.join();
+        }
+
+        // --- Phase 3: Sequential encode + mux (preserves frame order) ---
+        for (int i = 0; i < batch_size; ++i) {
+            int64_t current_frame = frame + i;
+
+            if (!slots[i].valid) {
+                std::cerr << "\nWarning: Failed to decode frame "
+                          << current_frame << "\n";
+                continue;
+            }
+
+            // Burn-in subtitles
+            if (sub_burner) {
+                double time_ms = static_cast<double>(current_frame) * 1000.0 *
+                                 comp.edit_rate_den / comp.edit_rate_num;
+                sub_burner->render(slots[i].rgb_buffer.data(), width, height,
+                                   time_ms, subs);
+            }
+
+            // Encode video frame
+            encoder->encode_frame(slots[i].rgb_buffer.data(), encoded_video);
+            if (!encoded_video.empty()) {
+                muxer.write_video(encoded_video.data(), encoded_video.size(),
+                                  current_frame);
+            }
+
+            // Read and encode audio (if present)
+            if (has_audio) {
+                int samples_per_frame = comp.audio_assets[0].sample_rate *
+                                        comp.edit_rate_den / comp.edit_rate_num;
+                if (audio_demux.read_audio(pcm_buffer, samples_per_frame)) {
+                    if (aac) {
+                        aac->encode(pcm_buffer.data(), pcm_buffer.size(),
+                                    encoded_audio);
+                        if (!encoded_audio.empty()) {
+                            muxer.write_audio(encoded_audio.data(),
+                                              encoded_audio.size(),
+                                              current_frame);
+                        }
+                    } else {
+                        // ProRes: write PCM directly
+                        muxer.write_audio(pcm_buffer.data(),
+                                          pcm_buffer.size(), current_frame);
+                    }
                 }
+            }
+
+            // Progress
+            if (progress_cb_) {
+                progress_cb_(current_frame + 1, total_frames);
             }
         }
 
-        // Progress
-        if (progress_cb_) {
-            progress_cb_(frame + 1, total_frames);
-        }
+        frame += batch_size;
     }
 
     // Flush encoder

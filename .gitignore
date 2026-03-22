@@ -3,3 +3,6 @@ build/
 *.tar.gz
 erreurs-make.txt
 .claude/
+.idea/
+DCPCONV_SPEC.md
+
