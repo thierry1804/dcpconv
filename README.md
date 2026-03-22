@@ -133,9 +133,9 @@ dcpconv/
 ```
 DCP/IMF Package
     │
-    ├── ASSETMAP.xml ──→ dcp_reader / imf_reader ──→ Composition
+    ├── ASSETMAP.xml ──> dcp_reader / imf_reader ──> Composition
     │                                                     │
-    ├── Video MXF ──→ mxf_demuxer ──→ J2K frames         │
+    ├── Video MXF ──> mxf_demuxer ──> J2K frames          │
     │                                    │                │
     │                              j2k_decoder            │
     │                                    │                │
@@ -143,18 +143,18 @@ DCP/IMF Package
     │                                    │                │
     │                         h264/h265/prores_encoder    │
     │                                    │                │
-    ├── Audio MXF ──→ mxf_demuxer ──→ PCM ──→ aac_encoder│
+    ├── Audio MXF ──> mxf_demuxer ──> PCM ──> aac_encoder │
     │                                              │      │
-    ├── Subtitle XML ──→ smpte_tt/cinecanvas/ttml  │      │
+    ├── Subtitle XML ──> smpte_tt/cinecanvas/ttml  │      │
     │                         │                    │      │
     │                   subtitle_burner            │      │
     │                   subtitle_muxer             │      │
     │                         │                    │      │
     └─────────────────────────┴────────────────────┘      │
                               │                           │
-                         mp4_muxer ──→ output.mp4/.mov    │
+                         mp4_muxer ──> output.mp4/.mov    │
                               │                           │
-                           pipeline ◄─────────────────────┘
+                           pipeline <─────────────────────┘
 ```
 
 ## Technical Notes
